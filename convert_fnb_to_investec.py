@@ -93,29 +93,27 @@ def parse_pdfplumber_words(words: list[dict]) -> list[dict]:
                 'y': word['top'],
             })
 
-    # For each account number, find the associated name
-    # Names are ABOVE the account number in FNB PDFs (within ~30 pixels above)
+    # For each account number, find the associated name and reference
+    # Names are ABOVE the account number in FNB PDFs (within ~35 pixels above)
+    # References are in the rightmost column (x > 400)
     for acc_info in account_positions:
         account = acc_info['account']
         acc_y = acc_info['y']
-        acc_x = acc_info['x']
 
-        # Find words that are above the account number (within 35 pixels)
-        # and in the left column (name column starts around x=37)
         name_words = []
+        ref_words = []
+
         for word in words_sorted:
             word_y = word['top']
             word_x = word['x0']
             text = word['text'].strip()
 
-            # Skip the account number itself
-            if text == account:
+            if not text or text == account:
                 continue
 
             # Check if word is above the account (within 35 pixels)
-            # and at similar x position (left column, x < 130)
             y_diff = acc_y - word_y
-            if 0 < y_diff <= 35 and word_x < 130:
+            if 0 < y_diff <= 35:
                 # Skip monetary amounts and dates
                 if re.match(r'^[\d,]+\.\d{2}$', text.replace(' ', '')):
                     continue
@@ -128,19 +126,39 @@ def parse_pdfplumber_words(words: list[dict]) -> list[dict]:
                 if text in ['0.00', 'Inactive', 'Recipient']:
                     continue
 
-                name_words.append({'text': text, 'x': word_x, 'y': word_y})
+                # Name column (x < 130)
+                if word_x < 130:
+                    name_words.append({'text': text, 'x': word_x, 'y': word_y})
+                # Reference column (x > 400, excluding amounts)
+                elif word_x > 400:
+                    ref_words.append({'text': text, 'x': word_x, 'y': word_y})
 
-        # Sort name words by y position (top to bottom), then x (left to right)
+        # Build name
         if name_words:
             name_words.sort(key=lambda w: (w['y'], w['x']))
             name = ' '.join(w['text'] for w in name_words)
             name = clean_name(name)
 
+            # Build reference - deduplicate words at same position
+            reference = name  # Default to name
+            if ref_words:
+                # Sort by y then x, and deduplicate overlapping text
+                ref_words.sort(key=lambda w: (w['y'], w['x']))
+                seen_positions = set()
+                unique_ref_words = []
+                for w in ref_words:
+                    pos_key = (round(w['y'] / 5), round(w['x'] / 5))
+                    if pos_key not in seen_positions:
+                        seen_positions.add(pos_key)
+                        unique_ref_words.append(w['text'])
+                if unique_ref_words:
+                    reference = ' '.join(unique_ref_words)
+
             if name and len(name) > 1:
                 recipients.append({
                     'name': name,
                     'account': account,
-                    'reference': name
+                    'reference': reference
                 })
 
     return recipients
@@ -209,7 +227,7 @@ def parse_fnb_table(table: list[list]) -> list[dict]:
 
 
 def extract_with_pymupdf(pdf_path: str) -> list[dict]:
-    """Extract recipient data using PyMuPDF (fitz) with block extraction."""
+    """Extract recipient data using PyMuPDF (fitz) with block-level extraction."""
     if fitz is None:
         raise ImportError("PyMuPDF is not installed")
 
@@ -217,113 +235,109 @@ def extract_with_pymupdf(pdf_path: str) -> list[dict]:
 
     doc = fitz.open(pdf_path)
     for page in doc:
-        # Extract text blocks which preserve layout better
-        blocks = page.get_text("dict")["blocks"]
-        page_recipients = parse_pymupdf_blocks(blocks)
+        page_data = page.get_text("dict")
+        page_recipients = parse_pymupdf_blocks_v2(page_data["blocks"])
         recipients.extend(page_recipients)
     doc.close()
 
     return recipients
 
 
-def parse_pymupdf_blocks(blocks: list) -> list[dict]:
-    """Parse text blocks from PyMuPDF to extract recipient data."""
+def parse_pymupdf_blocks_v2(blocks: list) -> list[dict]:
+    """
+    Parse text blocks from PyMuPDF to extract recipient data.
+    FNB PDF has overlapping columns - 'Their Reference' and 'My Reference' at same x position.
+    We extract the second occurrence which is 'My Reference'.
+    """
     recipients = []
     account_pattern = re.compile(r'^(\d{8,11})$')
 
-    # Collect all text spans with their positions
-    text_items = []
-    for block in blocks:
+    # Collect all spans with block index to track overlapping blocks
+    all_spans = []
+    for block_idx, block in enumerate(blocks):
         if "lines" not in block:
             continue
+        block_x = block["bbox"][0]
         for line in block["lines"]:
             for span in line["spans"]:
                 text = span["text"].strip()
                 if text:
-                    text_items.append({
+                    all_spans.append({
                         "text": text,
                         "x": span["bbox"][0],
                         "y": span["bbox"][1],
-                        "y_end": span["bbox"][3]
+                        "block_idx": block_idx,
+                        "block_x": block_x
                     })
 
-    # Sort by y position (top to bottom), then x position (left to right)
-    text_items.sort(key=lambda item: (round(item["y"] / 10) * 10, item["x"]))
+    # Find account numbers
+    account_spans = [s for s in all_spans if account_pattern.match(s["text"])]
 
-    # Group items by approximate y position (same row)
-    rows = []
-    current_row = []
-    last_y = None
+    for acc_span in account_spans:
+        account = acc_span["text"]
+        acc_y = acc_span["y"]
 
-    for item in text_items:
-        if last_y is None or abs(item["y"] - last_y) < 15:
-            current_row.append(item)
-        else:
-            if current_row:
-                rows.append(current_row)
-            current_row = [item]
-        last_y = item["y"]
-
-    if current_row:
-        rows.append(current_row)
-
-    # Process rows to find recipients
-    # Look for rows that contain an account number
-    for row in rows:
-        row_texts = [item["text"] for item in row]
-        row_combined = " ".join(row_texts)
-
-        # Skip headers and non-data rows
-        skip_keywords = [
-            'Name', 'Pay Amount', 'Last Paid', 'Their Reference', 'My Reference',
-            'Please note', 'Due to system', 'Real-time', 'Education',
-            'Entertainment', 'Medical', 'Motoring', 'Personal Services',
-            'Household', 'Family', 'Not Categorised', 'View the cut-off',
-            'Amount My'
+        # Find name - spans above account (within 35px), in left column (x < 130)
+        name_spans = [
+            s for s in all_spans
+            if s["x"] < 130
+            and 0 < acc_y - s["y"] <= 35
+            and not re.match(r'^[\d,]+\.\d{2}$', s["text"].replace(' ', ''))
+            and s["text"] not in ['0.00', 'Inactive', 'Recipient']
         ]
-        if any(keyword in row_combined for keyword in skip_keywords):
-            continue
+        name_spans.sort(key=lambda s: (s["y"], s["x"]))
+        name = ' '.join(s["text"] for s in name_spans)
+        name = clean_name(name)
 
-        # Find account numbers in row
-        for i, text in enumerate(row_texts):
-            if account_pattern.match(text):
-                account = text
-                # Name is typically in the text items before the account number
-                name_parts = []
-                for j in range(i):
-                    t = row_texts[j]
-                    # Skip monetary amounts and dates
-                    if re.match(r'^[\d,]+\.\d{2}$', t.replace(' ', '')):
-                        continue
-                    if re.match(r'^\d{2}\s+\w{3}\s+\d{4}$', t):
-                        continue
-                    if t in ['0.00', 'Inactive Recipient']:
-                        continue
-                    name_parts.append(t)
+        # Find reference - spans in reference column (x > 430), above account
+        # Use y-range of 40px to capture multi-line references without bleeding into adjacent rows
+        # Filter out header text
+        ref_spans = [
+            s for s in all_spans
+            if s["x"] > 430
+            and 0 < acc_y - s["y"] <= 40
+            and not re.match(r'^[\d,]+\.\d{2}$', s["text"].replace(' ', ''))
+            and s["text"].strip() not in ['Their', 'My', 'Reference', 'Amount']
+        ]
 
-                if name_parts:
-                    name = ' '.join(name_parts)
-                    name = clean_name(name)
+        # Group spans by y-position (rounded to nearest 2px for more precise grouping)
+        # At each y-level, there may be two spans: 'Their Reference' then 'My Reference'
+        # We want the second one (My Reference)
+        ref_by_y = {}
+        for s in ref_spans:
+            y_key = round(s["y"] / 2) * 2  # Round to nearest 2px
+            if y_key not in ref_by_y:
+                ref_by_y[y_key] = []
+            ref_by_y[y_key].append(s)
 
-                    # Reference is typically after the account number
-                    ref_parts = []
-                    for j in range(i + 1, len(row_texts)):
-                        t = row_texts[j]
-                        if re.match(r'^[\d,]+\.\d{2}$', t.replace(' ', '')):
-                            continue
-                        if re.match(r'^\d{2}\s+\w{3}\s+\d{4}$', t):
-                            continue
-                        ref_parts.append(t)
+        # Build reference from 'My Reference' column
+        # FNB PDFs have overlapping text - second span at each y is 'My Reference'
+        reference = name
+        if ref_by_y:
+            my_ref_spans = []
+            for y_key in sorted(ref_by_y.keys()):
+                spans_at_y = ref_by_y[y_key]
+                if len(spans_at_y) >= 2:
+                    # Two columns - take the second (My Reference)
+                    my_ref_spans.append(spans_at_y[1])
+                elif len(spans_at_y) == 1:
+                    # Single span - check if it looks like a continuation
+                    # or if it might be part of a split reference
+                    span = spans_at_y[0]
+                    my_ref_spans.append(span)
+            if my_ref_spans:
+                # Join and clean up the reference
+                ref_text = ' '.join(s["text"].strip() for s in my_ref_spans)
+                ref_text = re.sub(r'\s+', ' ', ref_text).strip()
+                if ref_text:
+                    reference = ref_text
 
-                    reference = ' '.join(ref_parts) if ref_parts else name
-
-                    if name and account:
-                        recipients.append({
-                            'name': name,
-                            'account': account,
-                            'reference': reference
-                        })
-                break
+        if name and len(name) > 1:
+            recipients.append({
+                'name': name,
+                'account': account,
+                'reference': reference
+            })
 
     return recipients
 
@@ -539,10 +553,11 @@ def extract_recipients(pdf_path: str, method: str = "auto") -> list[dict]:
 
     if method == "auto":
         # Try methods in order of preference
-        if pdfplumber is not None:
-            methods_to_try.append(("pdfplumber", extract_with_pdfplumber))
+        # PyMuPDF first as it handles FNB PDF column structure better
         if fitz is not None:
             methods_to_try.append(("pymupdf", extract_with_pymupdf))
+        if pdfplumber is not None:
+            methods_to_try.append(("pdfplumber", extract_with_pdfplumber))
         if pytesseract is not None and fitz is not None:
             methods_to_try.append(("ocr", extract_with_ocr))
     elif method == "pdfplumber":
