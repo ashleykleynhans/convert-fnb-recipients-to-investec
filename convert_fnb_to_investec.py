@@ -39,8 +39,72 @@ except ImportError:
     Image = None
 
 
-# FNB uses universal branch code for electronic payments
-FNB_BRANCH_CODE = "250655"
+# South African bank universal branch codes
+SA_BANK_BRANCH_CODES = {
+    "FNB": "250655",
+    "ABSA": "632005",
+    "Standard Bank": "051001",
+    "Nedbank": "198765",
+    "Capitec": "470010",
+    "Investec": "580105",
+    "African Bank": "430000",
+    "Bidvest Bank": "462005",
+    "Discovery Bank": "679000",
+    "TymeBank": "678910",
+}
+
+# South African bank account number prefixes
+# Format: (prefix, bank_name)
+SA_BANK_PREFIXES = [
+    # Nedbank - 3 digit prefixes
+    ("104", "Nedbank"),
+    ("152", "Nedbank"),
+    ("192", "Nedbank"),
+    # Standard Bank - 3 digit prefixes
+    ("101", "Standard Bank"),
+    ("102", "Standard Bank"),
+    ("202", "Standard Bank"),
+    ("242", "Standard Bank"),
+    # Investec - 3 digit prefix
+    ("100", "Investec"),
+    # Capitec - 2 digit prefixes
+    ("13", "Capitec"),
+    ("14", "Capitec"),
+    ("15", "Capitec"),
+    ("16", "Capitec"),
+    ("17", "Capitec"),
+    ("19", "Capitec"),
+    # ABSA - 2 digit prefixes
+    ("40", "ABSA"),
+    ("41", "ABSA"),
+    # TymeBank - 2 digit prefix
+    ("51", "TymeBank"),
+    # FNB - 2 digit prefixes
+    ("59", "FNB"),
+    ("60", "FNB"),
+    ("62", "FNB"),
+    ("63", "FNB"),
+]
+
+
+def detect_bank_from_account(account_number: str) -> tuple[str, str]:
+    """
+    Detect bank from account number prefix.
+    Returns (bank_name, branch_code) or ("", "") if unknown.
+    """
+    account = account_number.strip()
+
+    # Check 3-digit prefixes first (more specific)
+    for prefix, bank in SA_BANK_PREFIXES:
+        if len(prefix) == 3 and account.startswith(prefix):
+            return (bank, SA_BANK_BRANCH_CODES[bank])
+
+    # Then check 2-digit prefixes
+    for prefix, bank in SA_BANK_PREFIXES:
+        if len(prefix) == 2 and account.startswith(prefix):
+            return (bank, SA_BANK_BRANCH_CODES[bank])
+
+    return ("", "")
 
 # Investec CSV headers
 INVESTEC_HEADERS = [
@@ -509,15 +573,24 @@ def deduplicate_recipients(recipients: list[dict]) -> list[dict]:
 
 
 def convert_to_investec_format(recipients: list[dict]) -> list[dict]:
-    """Convert FNB recipients to Investec CSV format."""
+    """Convert FNB recipients to Investec CSV format.
+
+    Note: Bank and branch code fields are left empty as the FNB PDF does not
+    contain this information. Users must fill these in manually or use
+    the --default-bank option.
+    """
     investec_records = []
 
     for recipient in recipients:
+        # Get bank info if provided in recipient data, otherwise leave empty
+        bank = recipient.get('bank', '')
+        branch_code = recipient.get('branch_code', '')
+
         record = {
             "Beneficiary Account Name": recipient['name'],
-            "Beneficiary Bank": "FNB",
+            "Beneficiary Bank": bank,
             "Beneficiary Bank Account Number": recipient['account'],
-            "Beneficiary Branch Code": FNB_BRANCH_CODE,
+            "Beneficiary Branch Code": branch_code,
             "Beneficiary Reference": recipient.get('reference', recipient['name'])[:20],
             "Statement Description": recipient['name'][:20],
             "Beneficiary Name": recipient['name'],
@@ -634,6 +707,18 @@ Supported extraction methods:
         help="Enable verbose output"
     )
 
+    parser.add_argument(
+        "-b", "--default-bank",
+        choices=list(SA_BANK_BRANCH_CODES.keys()),
+        help="Set default bank for all recipients (e.g., FNB, ABSA, Standard Bank)"
+    )
+
+    parser.add_argument(
+        "-d", "--detect-bank",
+        action="store_true",
+        help="Auto-detect bank from account number prefix"
+    )
+
     args = parser.parse_args()
 
     # Validate input file
@@ -659,6 +744,31 @@ Supported extraction methods:
     recipients = deduplicate_recipients(recipients)
     if len(recipients) < original_count:
         print(f"Removed {original_count - len(recipients)} duplicate entries")
+
+    # Apply bank detection or default bank
+    if args.detect_bank:
+        detected_count = 0
+        unknown_count = 0
+        for recipient in recipients:
+            bank, branch_code = detect_bank_from_account(recipient['account'])
+            if bank:
+                recipient['bank'] = bank
+                recipient['branch_code'] = branch_code
+                detected_count += 1
+            else:
+                unknown_count += 1
+        print(f"Auto-detected bank for {detected_count} recipients")
+        if unknown_count > 0:
+            print(f"Warning: Could not detect bank for {unknown_count} recipients (unknown prefix)")
+    elif args.default_bank:
+        bank_name = args.default_bank
+        branch_code = SA_BANK_BRANCH_CODES[bank_name]
+        print(f"Setting default bank: {bank_name} (branch code: {branch_code})")
+        for recipient in recipients:
+            recipient['bank'] = bank_name
+            recipient['branch_code'] = branch_code
+    else:
+        print("Note: Bank and branch code fields are empty. Use --detect-bank or --default-bank")
 
     # Convert to Investec format
     investec_records = convert_to_investec_format(recipients)

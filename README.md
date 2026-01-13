@@ -13,10 +13,10 @@ an Investec-compatible CSV file.
 ## Features
 
 - Parses FNB recipient PDF exports using multiple extraction methods
-- Supports pdfplumber, PyMuPDF, and OCR (pytesseract) extraction
+- Supports PyMuPDF (default), pdfplumber, and OCR (pytesseract) extraction
 - Automatically deduplicates recipients
 - Generates CSV in Investec's beneficiary import format
-- Uses FNB's universal branch code (250655) for all recipients
+- Supports all major South African banks (FNB, ABSA, Standard Bank, Nedbank, Capitec, etc.)
 - Command-line interface with verbose output option
 
 ## Requirements
@@ -64,23 +64,31 @@ This will create `investec-beneficiaries.csv` in the current directory.
 python convert_fnb_to_investec.py fnb-recipients.pdf [OPTIONS]
 
 Options:
-  -o, --output FILE    Output CSV file path (default: investec-beneficiaries.csv)
-  -m, --method METHOD  PDF extraction method: auto, pdfplumber, pymupdf, ocr (default: auto)
-  -v, --verbose        Enable verbose output
-  -h, --help           Show help message
+  -o, --output FILE      Output CSV file path (default: investec-beneficiaries.csv)
+  -m, --method METHOD    PDF extraction method: auto, pdfplumber, pymupdf, ocr (default: auto)
+  -d, --detect-bank      Auto-detect bank from account number prefix (recommended)
+  -b, --default-bank     Set default bank for all recipients (FNB, ABSA, Standard Bank, etc.)
+  -v, --verbose          Enable verbose output
+  -h, --help             Show help message
 ```
 
 ### Examples
 
 ```bash
-# Specify output file
-python convert_fnb_to_investec.py fnb-recipients.pdf -o my-beneficiaries.csv
+# Auto-detect bank from account number prefix (recommended)
+python convert_fnb_to_investec.py fnb-recipients.pdf --detect-bank
 
-# Use specific extraction method
-python convert_fnb_to_investec.py fnb-recipients.pdf --method pymupdf
+# Basic usage (bank fields left empty for manual entry)
+python convert_fnb_to_investec.py fnb-recipients.pdf
+
+# Set all recipients to same bank (if you know they're all at one bank)
+python convert_fnb_to_investec.py fnb-recipients.pdf --default-bank FNB
+
+# Specify output file
+python convert_fnb_to_investec.py fnb-recipients.pdf -o my-beneficiaries.csv -d
 
 # Verbose output showing all extracted beneficiaries
-python convert_fnb_to_investec.py fnb-recipients.pdf -v
+python convert_fnb_to_investec.py fnb-recipients.pdf -v -d
 ```
 
 ## Output Format
@@ -90,15 +98,32 @@ The generated CSV follows Investec's beneficiary import template:
 | Column | Description |
 |--------|-------------|
 | Beneficiary Account Name | Account holder name |
-| Beneficiary Bank | Bank name (FNB) |
+| Beneficiary Bank | Bank name (empty unless --default-bank used) |
 | Beneficiary Bank Account Number | Account number |
-| Beneficiary Branch Code | Universal branch code (250655) |
+| Beneficiary Branch Code | Branch code (empty unless --default-bank used) |
 | Beneficiary Reference | Payment reference (max 20 chars) |
 | Statement Description | Statement description (max 20 chars) |
 | Beneficiary Name | Full beneficiary name |
 | Beneficiary Fax Number | (empty) |
 | Beneficiary Email Address | (empty) |
 | Beneficiary Cell Number | (empty) |
+
+### Supported Banks
+
+The `--detect-bank` option identifies banks by account number prefix:
+
+| Bank | Branch Code | Account Prefixes |
+|------|-------------|------------------|
+| FNB | 250655 | 59, 60, 62, 63 |
+| ABSA | 632005 | 40, 41 |
+| Standard Bank | 051001 | 101, 102, 202, 242 |
+| Nedbank | 198765 | 104, 152, 192 |
+| Capitec | 470010 | 13, 14, 15, 16, 17, 19 |
+| Investec | 580105 | 100 |
+| TymeBank | 678910 | 51 |
+| African Bank | 430000 | - |
+| Bidvest Bank | 462005 | - |
+| Discovery Bank | 679000 | - |
 
 ## How to Export Recipients from FNB
 
@@ -112,18 +137,19 @@ The generated CSV follows Investec's beneficiary import template:
 
 The tool supports multiple PDF extraction methods:
 
-- **pdfplumber** (default): Best for most FNB PDFs, uses word-level extraction with position data
-- **pymupdf**: Alternative text block extraction using PyMuPDF
+- **pymupdf** (default): Best for FNB PDFs with overlapping text columns
+- **pdfplumber**: Alternative word-level extraction
 - **ocr**: Uses Tesseract OCR for scanned or image-based PDFs
 
-The `auto` method tries each in order until one succeeds.
+The `auto` method tries PyMuPDF first, then pdfplumber, then OCR.
 
 ## Limitations
 
-- Only extracts recipients with valid FNB account numbers (8-11 digits)
+- Only extracts recipients with valid SA bank account numbers (8-11 digits)
+- Bank detection relies on known account prefixes - some accounts may not be detected
 - Email, fax, and cell number fields are left empty (not available in FNB PDF)
-- All recipients are assumed to be FNB accounts with branch code 250655
 - Reference fields are truncated to 20 characters (Investec limit)
+- The FNB PDF has two reference columns ("Their Reference" and "My Reference") - this tool extracts "My Reference"
 
 ## Troubleshooting
 
